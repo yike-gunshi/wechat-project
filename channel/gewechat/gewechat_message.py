@@ -341,8 +341,11 @@ class GeWeChatMessage(ChatMessage):
                 silk_file_path = TmpDir().path() + silk_file_name
                 with open(silk_file_path, "wb") as f:
                     f.write(silk_data)
-                # TODO: silk2mp3
                 self.content = silk_file_path
+                self._prepare_fn = self.download_voice
+            else:
+                logger.warning(f"[gewechat] Voice message without ImgBuf data")
+                self.content = None
         elif msg_type == 3:  # Image message
             self.ctype = ContextType.IMAGE
             self.content = TmpDir().path() + str(self.msg_id) + ".png"
@@ -445,18 +448,14 @@ class GeWeChatMessage(ChatMessage):
 
         if self.is_group:
             # 如果是群聊消息，获取实际发送者信息
-            # 群聊信息结构
-            """
-            {
-                "Data": {
-                    "Content": {
-                        "string": "wxid_xxx:\n@name msg_content" // 发送消息人的wxid和消息内容(包含@name)
-                    }
-                }
-            }
-            """
-            # 获取实际发送者wxid
-            self.actual_user_id = self.msg.get('Data', {}).get('Content', {}).get('string', '').split(':', 1)[0]  # 实际发送者ID
+            content_str = self.msg.get('Data', {}).get('Content', {}).get('string', '')
+            if ':' in content_str:
+                self.actual_user_id = content_str.split(':', 1)[0]
+            else:
+                self.actual_user_id = self.from_user_id
+            
+            logger.debug(f"[gewechat] actual_user_id before processing: {self.actual_user_id}")
+
             # 从群成员列表中获取实际发送者信息
             """
             {
@@ -480,28 +479,15 @@ class GeWeChatMessage(ChatMessage):
             """
             chatroom_member_list_response = self.client.get_chatroom_member_list(self.app_id, self.from_user_id)
             if chatroom_member_list_response.get('ret', 0) == 200 and chatroom_member_list_response.get('data', {}).get('memberList', []):
-                # 从群成员列表中匹配acual_user_id
                 for member_info in chatroom_member_list_response['data']['memberList']:
                     if member_info['wxid'] == self.actual_user_id:
-                        # 先获取displayName，如果displayName为空，再获取nickName
-                        self.actual_user_nickname = member_info.get('displayName', '')
-                        if not self.actual_user_nickname:
-                            self.actual_user_nickname = member_info.get('nickName', '')
+                        self.actual_user_nickname = member_info.get('displayName', '') or member_info.get('nickName', '')
                         break
-            # 如果actual_user_nickname为空，使用actual_user_id作为nickname
+            
             if not self.actual_user_nickname:
                 self.actual_user_nickname = self.actual_user_id
 
             # 检查是否被at
-            # 群聊at结构
-            """
-            {
-                'Data': {
-                    'MsgSource': '<msgsource>\n\t<atuserlist><![CDATA[,wxid_xxx,wxid_xxx]]></atuserlist>\n\t<pua>1</pua>\n\t<silence>0</silence>\n\t<membercount>3</membercount>\n\t<signature>V1_cqxXBat9|v1_cqxXBat9</signature>\n\t<tmp_node>\n\t\t<publisher-id></publisher-id>\n\t</tmp_node>\n</msgsource>\n',
-                },
-            }
-            """
-            # 优先从MsgSource的XML中解析是否被at
             msg_source = self.msg.get('Data', {}).get('MsgSource', '')
             self.is_at = False
             xml_parsed = False
@@ -517,16 +503,16 @@ class GeWeChatMessage(ChatMessage):
                 except ET.ParseError:
                     pass
 
-            # 只有在XML解析失败时才从PushContent中判断
             if not xml_parsed:
                 self.is_at = '在群聊中@了你' in self.msg.get('Data', {}).get('PushContent', '')
                 logger.debug(f"[gewechat] Parse is_at from PushContent. self.is_at: {self.is_at}")
 
-            # 如果是群消息，使用正则表达式去掉wxid前缀和@信息
-            self.content = re.sub(f'{self.actual_user_id}:\n', '', self.content)  # 去掉wxid前缀
-            self.content = re.sub(r'@[^\u2005]+\u2005', '', self.content)  # 去掉@信息
+            # 只对文本消息进行内容处理
+            if self.ctype == ContextType.TEXT:
+                if ':' in self.content:
+                    self.content = self.content.split(':', 1)[1].strip()  # 去掉wxid前缀
+                self.content = re.sub(r'@[^\u2005]+\u2005', '', self.content)  # 去掉@信息
         else:
-            # 如果不是群聊消息，保持结构统一，也要设置actual_user_id和actual_user_nickname
             self.actual_user_id = self.other_user_id
             self.actual_user_nickname = self.other_user_nickname
 
